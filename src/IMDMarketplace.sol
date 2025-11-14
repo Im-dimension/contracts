@@ -160,6 +160,87 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
         return idToListedToken[tokenId];
     }
 
+    /// @notice Return latest listed token info (if any)
+    function getLatestIdToListedToken() external view returns (ListedToken memory) {
+        uint256 currentTokenId = _tokenIds;
+        return idToListedToken[currentTokenId];
+    }
+
+    function getCurrentToken() external view returns (uint256) {
+        return _tokenIds;
+    }
+
+    /// @notice Return all tokens (listed or not) represented as ListedToken entries.
+    function getAllNFTs() external view returns (ListedToken[] memory) {
+        uint total = _tokenIds;
+        ListedToken[] memory tokens = new ListedToken[](total);
+        for (uint i = 0; i < total; i++) {
+            uint id = i + 1;
+            tokens[i] = idToListedToken[id];
+        }
+        return tokens;
+    }
+
+    /// @notice Returns ListedToken[] for tokens where mapping indicates seller==user OR owner==user and currentlyListed==true
+    function getListedTokensByUser(address user) external view returns (ListedToken[] memory) {
+        uint total = _tokenIds;
+        uint count = 0;
+
+        for (uint i = 0; i < total; i++) {
+            uint id = i + 1;
+            ListedToken storage lt = idToListedToken[id];
+            if (lt.seller == user || (lt.owner == user && lt.currentlyListed == true)) {
+                count++;
+            }
+        }
+
+        ListedToken[] memory results = new ListedToken[](count);
+        uint idx = 0;
+        for (uint i = 0; i < total; i++) {
+            uint id = i + 1;
+            ListedToken storage lt = idToListedToken[id];
+            if (lt.seller == user || (lt.owner == user && lt.currentlyListed == true)) {
+                results[idx] = lt;
+                idx++;
+            }
+        }
+        return results;
+    }
+
+    /// @notice Returns token IDs owned by the given user along with tokenURI
+    function getTokensOwnedBy(address user) external view returns (TokenInfo[] memory) {
+        uint total = _tokenIds;
+        uint count = 0;
+        for (uint i = 0; i < total; i++) {
+            uint id = i + 1;
+            if (_tokenExists(id)) {
+                // ownerOf(id) will not revert because _tokenExists returned true
+                if (ownerOf(id) == user) {
+                    count++;
+                }
+            }
+        }
+
+        TokenInfo[] memory results = new TokenInfo[](count);
+        uint idx = 0;
+        for (uint i = 0; i < total; i++) {
+            uint id = i + 1;
+            if (_tokenExists(id)) {
+                if (ownerOf(id) == user) {
+                    string memory uri = tokenURI(id);
+                    results[idx] = TokenInfo(id, uri);
+                    idx++;
+                }
+            }
+        }
+        return results;
+    }
+
+    /// @notice Convenience: returns tokens either owned by or previously listed by msg.sender
+    function getMyNFTs() external view returns (ListedToken[] memory) {
+        return this.getListedTokensByUser(msg.sender);
+    }
+
     /// @dev Compatibility helper to determine whether a token exists without relying on internal `_exists()`.
     /// Uses try/catch around external call to `ownerOf` which reverts for non-existent tokens.
     function _tokenExists(uint256 tokenId) internal view returns (bool) {
@@ -169,4 +250,10 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
             return false;
         }
     }
+
+    /* ========== FALLBACKS ========== */
+
+    // No withdraw needed since listing fees were removed, but accept ETH if someone sends.
+    receive() external payable {}
+    fallback() external payable {}
 }
