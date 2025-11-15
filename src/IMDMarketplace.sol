@@ -1,13 +1,11 @@
-// SPDX-License-Identifier: Unlicense
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 import "forge-std/console.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title NFT Marketplace (mint, list, buy, resell, cancel, queries)
-
-contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
+contract ImpossibleDimensionMarket is ERC721URIStorage, ReentrancyGuard {
     uint256 private _tokenIds;
     uint256 private _itemsSold;
 
@@ -16,7 +14,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
     struct ListedToken {
         uint256 tokenId;
         address payable owner;   
-        address payable seller;  
+        address payable seller;  // who listed it for sale (address(0) if not listed)
         uint256 price;
         bool currentlyListed;
     }
@@ -26,6 +24,12 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
         uint256 tokenId;
         string tokenURI;
     }
+
+    // Mapping tokenId => listing info
+    mapping(uint256 => ListedToken) private idToListedToken;
+    // Encrypted URI stored 
+    mapping(uint256 => bytes) private encryptedTokenURI;
+    mapping(uint256 => bytes32) private tokenSecretHash;
 
     event TokenListedSuccess (
         uint256 indexed tokenId,
@@ -41,40 +45,68 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
         address seller
     );
 
-    mapping(uint256 => ListedToken) private idToListedToken;
+    event EncryptedTokenMinted(
+        uint256 indexed tokenId,
+        address indexed minter,
+        bytes32 secretHash,
+        uint256 price
+    );
+
+    event TokenUnlocked(
+        uint256 indexed tokenId,
+        address indexed claimer
+    );
 
     constructor() ERC721("Impossible Dimension Market", "IDM") {
-    owner = payable(msg.sender);
+        owner = payable(msg.sender);
     }
 
+   
 
-
-
-    /// @notice Mint a new token and list it for sale 
     function createToken(string memory tokenURI_, uint256 price) external nonReentrant returns (uint256) {
-        require(price >= 0, "Price must be positive");
-
+        // price may be zero
         _tokenIds++;
         uint256 newTokenId = _tokenIds;
 
-        // Mint token to the minter
         _safeMint(msg.sender, newTokenId);
         _setTokenURI(newTokenId, tokenURI_);
 
-        // Create the listing by transferring token to contract
         _createListedToken(newTokenId, price, msg.sender);
 
         return newTokenId;
     }
 
-    /// @dev Internal helper used by createToken and listToken/resellToken
+    /// @dev encryptedURI passed as bytes calldata. secretHash = keccak256(secret) (computed off-chain).
+    function mintEncryptedToken(bytes calldata encryptedURI, bytes32 secretHash, uint256 price) external nonReentrant returns (uint256) {
+        // price may be zero
+        require(secretHash != bytes32(0), "MINT_ERROR: Secret hash cannot be zero");
+        require(encryptedURI.length > 0, "MINT_ERROR: Encrypted URI cannot be empty");
+
+        _tokenIds++;
+        uint256 newTokenId = _tokenIds;
+
+        // Mint to minter
+        _safeMint(msg.sender, newTokenId);
+        // Store encrypted bytes 
+        encryptedTokenURI[newTokenId] = encryptedURI;
+        // Store secret hash for one-time unlock
+        tokenSecretHash[newTokenId] = secretHash;
+
+        // Transfer token to marketplace and create listing
+        _createListedToken(newTokenId, price, msg.sender);
+
+        emit EncryptedTokenMinted(newTokenId, msg.sender, secretHash, price);
+        return newTokenId;
+    }
+
+    /// @dev Internal helper used by createToken, mintEncryptedToken, listToken/resellToken
     function _createListedToken(uint256 tokenId, uint256 price, address lister) internal {
-        // Transfer token from lister to this contract (lister must be owner)
+        // transfer token from lister to this contract (lister must be owner or approved)
         _transfer(lister, address(this), tokenId);
 
         idToListedToken[tokenId] = ListedToken(
             tokenId,
-            payable(address(this)),        // contract holds it while listed
+            payable(address(this)),
             payable(lister),
             price,
             true
@@ -85,79 +117,149 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
 
    
 
+    /// @notice List an existing token (owner can list). price may be zero.
     function listToken(uint256 tokenId, uint256 price) external nonReentrant {
-        require(_tokenExists(tokenId), "Token doesn't exist");
-        require(ownerOf(tokenId) == msg.sender, "Only token owner can list");
-        require(price > 0, "Price must be positive");
+        require(_tokenExists(tokenId), "LIST_ERROR: Token does not exist");
+        require(ownerOf(tokenId) == msg.sender, "LIST_ERROR: Only token owner can list");
+        // price may be zero
 
-        // Transfer token to marketplace contract and create mapping entry
         _createListedToken(tokenId, price, msg.sender);
     }
 
-    /// @notice Resell token after purchasing (owner can call to relist)
+    /// @notice Resell token after purchasing (owner can call to relist). price may be zero.
     function resellToken(uint256 tokenId, uint256 price) external nonReentrant {
-        require(_tokenExists(tokenId), "Token doesn't exist");
-        require(ownerOf(tokenId) == msg.sender, "Only token owner can resell");
-        require(price > 0, "Price must be positive");
+        require(_tokenExists(tokenId), "RESELL_ERROR: Token does not exist");
+        require(ownerOf(tokenId) == msg.sender, "RESELL_ERROR: Only token owner can resell");
+        // price may be zero
 
         _createListedToken(tokenId, price, msg.sender);
     }
 
-    /* ========== CANCEL LISTING ========== */
-
-    /// @notice Allows the seller (who listed it) to cancel their listing 
+    /// @notice Cancel a listing and return token to seller 
     function cancelListing(uint256 tokenId) external nonReentrant {
-        require(_tokenExists(tokenId), "Token doesn't exist");
+        require(_tokenExists(tokenId), "CANCEL_ERROR: Token does not exist");
         ListedToken storage listed = idToListedToken[tokenId];
-        require(listed.currentlyListed == true, "Token is not listed");
-        require(listed.seller == msg.sender, "Only seller can cancel listing");
-        require(ownerOf(tokenId) == address(this), "Contract does not hold the token");
+        require(listed.currentlyListed == true, "CANCEL_ERROR: Token is not currently listed");
+        require(listed.seller == msg.sender, "CANCEL_ERROR: Only the seller can cancel this listing");
+        require(ownerOf(tokenId) == address(this), "CANCEL_ERROR: Contract does not hold the token");
 
         address payable seller = listed.seller;
 
-        // Update mapping: mark unlisted and set owner to seller
         listed.currentlyListed = false;
-        listed.owner = seller;               // seller regains ownership in mapping
-        listed.seller = payable(address(0)); // clear seller
+        listed.owner = seller;
+        listed.seller = payable(address(0));
 
-        // Transfer token back to seller
         _transfer(address(this), seller, tokenId);
 
         emit TokenUnlisted(tokenId, seller, address(0));
     }
 
-    
 
-    /// @notice Buy a listed token by sending the exact price (msg.value)
-    function executeSale(uint256 tokenId) external payable nonReentrant {
-        require(_tokenExists(tokenId), "Token doesn't exist");
+    /// @notice Provide `secret` (bytes) used to XOR-decrypt stored encryptedURI. Contract will
+    ///         verify keccak256(secret) matches stored hash, decrypt stored encryptedURI bytes,
+    ///         set tokenURI to decrypted string, clear stored secret/encrypted bytes, and transfer token to caller.
+    function unlockAndClaim(uint256 tokenId, bytes calldata secret) external nonReentrant {
+        // Check 1: Token must exist
+        require(_tokenExists(tokenId), "UNLOCK_ERROR: Token does not exist");
+
         ListedToken storage listed = idToListedToken[tokenId];
-        require(listed.currentlyListed == true, "Token is not listed for sale");
-        uint256 price = listed.price;
-        address payable seller = listed.seller;
-        require(msg.value == price, "Please submit the asking price to complete the purchase");
+        
+        // Check 2: Token must be currently listed
+        require(listed.currentlyListed == true, "UNLOCK_ERROR: Token is not currently listed for unlock");
+        
+        // Check 3: Contract must hold the token
+        address currentOwner = ownerOf(tokenId);
+        require(currentOwner == address(this), "UNLOCK_ERROR: Marketplace does not hold the token");
+        
+        // Check 4: Secret must not be empty
+        require(secret.length > 0, "UNLOCK_ERROR: Secret cannot be empty");
 
-        // Effects: update storage before making external calls
+        // Check 5: Token must have a secret hash stored (meaning it was minted as encrypted)
+        bytes32 storedHash = tokenSecretHash[tokenId];
+        require(storedHash != bytes32(0), "UNLOCK_ERROR: Token is not encrypted or already unlocked");
+
+        // Check 6: Verify the provided secret matches the stored hash
+        bytes32 providedHash = keccak256(secret);
+        require(providedHash == storedHash, "UNLOCK_ERROR: Invalid secret - hash mismatch");
+
+        // Check 7: Encrypted data must exist
+        bytes storage enc = encryptedTokenURI[tokenId];
+        require(enc.length > 0, "UNLOCK_ERROR: No encrypted URI data stored for this token");
+
+        // Decrypt (XOR) stored encrypted bytes with secret bytes
+        bytes memory dec = _xorBytes(enc, secret);
+
+        // Set the tokenURI to decrypted string
+        string memory plainURI = string(dec);
+        _setTokenURI(tokenId, plainURI);
+
+        // Clear stored encrypted bytes & secretHash 
+        delete encryptedTokenURI[tokenId];
+        tokenSecretHash[tokenId] = bytes32(0);
+
+        // Update listing state and transfer token to caller
         listed.currentlyListed = false;
-        listed.owner = payable(msg.sender);   // buyer becomes holder in mapping
-        listed.seller = payable(address(0));  // clear seller
+        listed.owner = payable(msg.sender);
+        listed.seller = payable(address(0));
         _itemsSold++;
 
-        // Transfer token to buyer
         _transfer(address(this), msg.sender, tokenId);
 
-       
-        (bool sentSeller, ) = seller.call{value: msg.value}("");
-        require(sentSeller, "Failed to send funds to seller");
+        emit TokenUnlocked(tokenId, msg.sender);
+    }
+
+    function _xorBytes(bytes storage enc, bytes calldata secret) internal view returns (bytes memory) {
+        uint256 n = enc.length;
+        bytes memory out = new bytes(n);
+        uint256 sLen = secret.length;
+        require(sLen > 0, "secret length zero");
+
+        for (uint256 i = 0; i < n; i++) {
+            out[i] = bytes1(uint8(enc[i]) ^ uint8(secret[i % sLen]));
+        }
+        return out;
+    }
+
+
+    function executeSale(uint256 tokenId) external payable nonReentrant {
+        require(_tokenExists(tokenId), "SALE_ERROR: Token does not exist");
+        ListedToken storage listed = idToListedToken[tokenId];
+        require(listed.currentlyListed == true, "SALE_ERROR: Token is not listed for sale");
+        uint256 price = listed.price;
+        address payable seller = listed.seller;
+        require(msg.value == price, "SALE_ERROR: Incorrect payment amount - must match listing price exactly");
+
+        // Effects
+        listed.currentlyListed = false;
+        listed.owner = payable(msg.sender);
+        listed.seller = payable(address(0));
+        _itemsSold++;
+
+        // Transfer token
+        _transfer(address(this), msg.sender, tokenId);
+
+        if (price > 0) {
+            (bool sentSeller, ) = seller.call{value: msg.value}("");
+            require(sentSeller, "SALE_ERROR: Failed to send funds to seller");
+        }
 
         emit TokenListedSuccess(tokenId, msg.sender, address(0), price, false);
     }
 
 
-
     /// @notice Return mapping info for a specific token id
     function getListedTokenForId(uint256 tokenId) external view returns (ListedToken memory) {
         return idToListedToken[tokenId];
+    }
+
+    /// @notice Get the stored secret hash for a token 
+    function getTokenSecretHash(uint256 tokenId) external view returns (bytes32) {
+        return tokenSecretHash[tokenId];
+    }
+
+    /// @notice Get the stored encrypted URI for a token (for debugging)
+    function getEncryptedTokenURI(uint256 tokenId) external view returns (bytes memory) {
+        return encryptedTokenURI[tokenId];
     }
 
     /// @notice Return latest listed token info (if any)
@@ -214,7 +316,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
         for (uint i = 0; i < total; i++) {
             uint id = i + 1;
             if (_tokenExists(id)) {
-                // ownerOf(id) will not revert because _tokenExists returned true
                 if (ownerOf(id) == user) {
                     count++;
                 }
@@ -241,8 +342,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
         return this.getListedTokensByUser(msg.sender);
     }
 
-    /// @dev Compatibility helper to determine whether a token exists without relying on internal `_exists()`.
-    /// Uses try/catch around external call to `ownerOf` which reverts for non-existent tokens.
+
     function _tokenExists(uint256 tokenId) internal view returns (bool) {
         try this.ownerOf(tokenId) returns (address) {
             return true;
@@ -251,9 +351,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard {
         }
     }
 
-    /* ========== FALLBACKS ========== */
 
-    // No withdraw needed since listing fees were removed, but accept ETH if someone sends.
     receive() external payable {}
     fallback() external payable {}
 }
